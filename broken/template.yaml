@@ -1,0 +1,312 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Comprehensive Order Processing Serverless Workflow
+
+Resources:
+  # DynamoDB Table for Orders
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: MyOrdersTable
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      AttributeDefinitions:
+        - AttributeName: OrderId
+          AttributeType: B
+      KeySchema:
+        - AttributeName: OrderId
+          KeyType: HASH
+
+  # SQS Queue for Order Processing
+  OrderProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 900
+      MaximumMessageSize: 1024
+      MessageRetentionPeriod: 60
+      ReceiveMessageWaitTimeSeconds: 20
+      VisibilityTimeout: 0
+      QueueName: MyOrderProcessingQueue
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDeadLetterQueue.Arn
+        maxReceiveCount: 1
+
+  # Dead Letter Queue
+  OrderDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 900
+      MaximumMessageSize: 1024
+      MessageRetentionPeriod: 60
+      ReceiveMessageWaitTimeSeconds: 20
+      QueueName: MyOrderDeadLetterQueue
+        
+
+  # SNS Topic for Order Notifications
+  OrderNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: MyOrderNotificationTopic
+
+  # SNS Subscription to SQS
+  OrderNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderNotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt OrderProcessingQueue.Arn
+      RawMessageDelivery: true
+      FilterPolicyScope: MessageBody
+      FilterPolicy:
+        view:
+          blocks:
+            order_id:
+              - "order_process"
+
+
+  # SQS Queue Policy to Allow SNS Publishing
+  OrderProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderProcessingQueue
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: SQS:SendMessage
+            Resource: !GetAtt OrderProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderNotificationTopic
+
+  # IAM Role for Step Functions
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MyStepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Deny
+                Action:
+                  - lambda:InvokeFunction
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - dynamodb:PutItem
+                Resource: "*"
+
+  # Lambda Functions
+  ValidateOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: validate-order.handler
+      Runtime: python3.9
+      CodeUri: src
+      Timeout: 1
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt OrderProcessingQueue.QueueName
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_QUEUE_URL: !Ref OrderProcessingQueue
+      ReservedConcurrentExecutions: 0
+
+  SaveOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: save-order.handler
+      Runtime: python3.9
+      CodeUri: src
+      Timeout: 1
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref OrdersTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderNotificationTopic.TopicName
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Ref OrdersTable
+          ORDER_NOTIFICATION_TOPIC: !Ref OrderNotificationTopic
+      ReservedConcurrentExecutions: 0
+
+  NotifyOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: notifyorder.handler
+      Runtime: python3.9
+      CodeUri: src
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderNotificationTopic.TopicName
+      Environment:
+        Variables:
+          ORDER_NOTIFICATION_TOPIC: !Ref OrderNotificationTopic
+      ReservedConcurrentExecutions: 0
+
+  # Step Functions State Machine
+  OrderProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Order Processing Workflow",
+          "StartAt": "Validate Order",
+          "States": {
+            "Validate Order": {
+              "Type": "Task",
+              "Resource": "${ValidateOrderFunction.Arn}",
+              "Next": "Wait Before Save Order",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "Validation Failed"
+                }
+              ]
+            },
+            "Wait Before Save Order": {
+              "Type": "Wait",
+              "Seconds": 3600,
+              "Next": "Save Order"
+            },
+            "Save Order": {
+              "Type": "Task",
+              "Resource": "${SaveOrderFunction.Arn}",
+              "Next": "Wait Before Notify Order",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "Save Order Failed"
+                }
+              ]
+            },
+            "Wait Before Notify Order": {
+              "Type": "Wait",
+              "Seconds": 3600,
+              "Next": "Notify Order"
+            },
+            "Notify Order": {
+              "Type": "Task",
+              "Resource": "${NotifyOrderFunction.Arn}",
+              "End": true,
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "Notification Failed"
+                }
+              ]
+            },
+            "Validation Failed": {
+              "Type": "Fail",
+              "Cause": "Order validation failed"
+            },
+            "Save Order Failed": {
+              "Type": "Fail",
+              "Cause": "Unable to save order"
+            },
+            "Notification Failed": {
+              "Type": "Fail",
+              "Cause": "Unable to send order notification"
+            }
+          }
+        }
+
+
+  # Lambda Function to Handle Order Submission
+  OrderSubmissionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: order-submission.handler
+      Runtime: python3.9
+      CodeUri: src
+      Timeout: 1
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt OrderNotificationTopic.TopicName
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt OrderProcessingStateMachine.Name
+      Environment:
+        Variables:
+          ORDER_NOTIFICATION_TOPIC: !Ref OrderNotificationTopic
+          ORDER_PROCESSING_STATE_MACHINE: !Ref OrderProcessingStateMachine
+      Events:
+        OrderApi:
+          Type: Api
+          Properties:
+            Path: /orders
+            Method: post
+            RestApiId: !Ref OrderApi
+      ReservedConcurrentExecutions: 0
+
+    # API Gateway with explicit Lambda integration
+  OrderApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: "Order Processing API"
+        paths:
+          /orders:
+            post:
+              produces:
+                - "application/json"
+              responses:
+                "200":
+                  description: "Successful order processing"
+              x-amazon-apigateway-integration:
+                type: "aws_proxy"
+                httpMethod: "POST"
+                uri: 
+                  !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2013600-03-31/functions/${OrderSubmissionFunction.Arn}/invocations"
+                responses:
+                  default:
+                    statusCode: "200"
+
+  # IAM Role for API Gateway to SNS
+  ApiGatewayToSNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: MySNSPublishPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Deny
+                Action: sns:Publish
+                Resource: !Ref OrderNotificationTopic
+
+Outputs:
+  OrderNotificationTopicFullArn:
+    Description: "Full SNS Topic ARN for order notifications"
+    Value: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:OrderNotificationTopic"
+  
+  OrderNotificationTopicArn:
+    Description: "SNS Topic ARN for order notifications"
+    Value: !Ref OrderNotificationTopic
+  
+  OrderProcessingQueueURL:
+    Description: "SQS Queue URL for order processing"
+    Value: !Ref OrderProcessingQueue
