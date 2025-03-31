@@ -4,12 +4,14 @@ import os
 import boto3
 import logging
 import uuid
+import time
 
 sqs = boto3.client('sqs')
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 def handler(event, context):
+    time.sleep(10)
     try:
         # Extract message from SNS event
         order=event
