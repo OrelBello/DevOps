@@ -3,10 +3,11 @@ import json
 import os
 import boto3
 import logging
+import time
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-
+time.sleep(5)
 def handler(event, context):
     try:
         # Extract message from SNS event
