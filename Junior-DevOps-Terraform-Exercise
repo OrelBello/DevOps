@@ -1,0 +1,26 @@
+Exercise Content for a Junior DevOps role
+
+1. Create an automation that will deploy AWS infrastructure that will include the following items: 
+
+VPC with Internet Gateway and Internet access
+4 Subnets - 2 public subnets & 2 private subnets
+Public subnets - internet access via the Internet Gateway
+Private subnets - internet access via NAT Gateway
+Regions, CIDR ranges, tags and anything that is not mentioned is at your full discretion.
+
+You may use any automation framework you prefer.
+
+ 
+
+2. Deploying a simple “Hello World” container on an ECS cluster
+
+You should deploy it with: 
+
+Service Autoscaling - with at least 2 running tasks (containers)
+Application Load Balancer -  Internet access
+Tasks (Containers) - On private subnets 
+Keep in mind, the application should be exposed to the Internet with the application load balancer (ALB) only.
+
+3. Create a CD pipeline that will automatically be rolling update the  "Hello World" application with the new changes. 
+
+Create a CD pipeline with a CodeBuild and CodePipeline that will connect to the repository where the code stores and push the changes you made to a new container deployment (docker image) on ECS.
